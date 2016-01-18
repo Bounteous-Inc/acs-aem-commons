@@ -19,15 +19,12 @@
  */
 package com.adobe.acs.commons.wcm.impl;
 
-import java.io.IOException;
-import java.util.*;
-
-import javax.servlet.ServletException;
-import javax.xml.stream.XMLOutputFactory;
-import javax.xml.stream.XMLStreamException;
-import javax.xml.stream.XMLStreamWriter;
-
+import com.day.cq.commons.Externalizer;
 import com.day.cq.dam.api.Asset;
+import com.day.cq.dam.api.DamConstants;
+import com.day.cq.wcm.api.Page;
+import com.day.cq.wcm.api.PageFilter;
+import com.day.cq.wcm.api.PageManager;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.time.FastDateFormat;
 import org.apache.felix.scr.annotations.Activate;
@@ -39,16 +36,30 @@ import org.apache.felix.scr.annotations.Reference;
 import org.apache.felix.scr.annotations.Service;
 import org.apache.sling.api.SlingHttpServletRequest;
 import org.apache.sling.api.SlingHttpServletResponse;
+import org.apache.sling.api.resource.AbstractResourceVisitor;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.api.resource.ResourceResolver;
 import org.apache.sling.api.resource.ValueMap;
 import org.apache.sling.api.servlets.SlingSafeMethodsServlet;
 import org.apache.sling.commons.osgi.PropertiesUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import com.day.cq.commons.Externalizer;
-import com.day.cq.wcm.api.Page;
-import com.day.cq.wcm.api.PageFilter;
-import com.day.cq.wcm.api.PageManager;
+import javax.jcr.Node;
+import javax.jcr.RepositoryException;
+import javax.servlet.ServletException;
+import javax.xml.stream.XMLOutputFactory;
+import javax.xml.stream.XMLStreamException;
+import javax.xml.stream.XMLStreamWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
 @Component(metatype = true, label = "ACS AEM Commons - Site Map Servlet", description = "Site Map Servlet",
         configurationFactory = true)
@@ -64,7 +75,8 @@ import com.day.cq.wcm.api.PageManager;
                 value = "Site Map for: {externalizer.domain}, on resource types: [{sling.servlet.resourceTypes}]")
 })
 public final class SiteMapServlet extends SlingSafeMethodsServlet {
-    
+    private static final Logger log = LoggerFactory.getLogger(SiteMapServlet.class);
+
     private static final FastDateFormat DATE_FORMAT = FastDateFormat.getInstance("yyyy-MM-dd");
 
     private static final boolean DEFAULT_INCLUDE_LAST_MODIFIED = false;
@@ -139,61 +151,45 @@ public final class SiteMapServlet extends SlingSafeMethodsServlet {
             stream.writeStartElement("", "urlset", NS);
             stream.writeNamespace("", NS);
 
+
+            /* Write the CQ Pages to the Sitemap XML */
+
             // first do the current page
-            write(page, stream, resourceResolver);
+            writePage(page, stream, resourceResolver);
 
             for (Iterator<Page> children = page.listChildren(new PageFilter(), true); children.hasNext();) {
-                write(children.next(), stream, resourceResolver);
+                writePage(children.next(), stream, resourceResolver);
             }
 
+            /* Write the DAM Assets to the Sitemap XML */
             if (damAssetTypes.size() > 0 && damAssetProperty.length() > 0) {
-                for (Resource assetFolder : getAssetFolders(page, resourceResolver)) {
-                    writeAssets(stream, assetFolder, resourceResolver);
-                }
+                writeAssets(page.getProperties().get(damAssetProperty, new String[]{}), stream, resourceResolver);
             }
 
             stream.writeEndElement();
-
             stream.writeEndDocument();
+
         } catch (XMLStreamException e) {
             throw new IOException(e);
-        }
-    }
-
-    private Collection<Resource> getAssetFolders(Page page, ResourceResolver resolver) {
-        Map<String, Resource> allAssetFolders = new TreeMap<String, Resource>();
-        ValueMap properties = page.getProperties();
-        String[] configuredAssetFolderPaths = properties.get(damAssetProperty, String[].class);
-        if (configuredAssetFolderPaths != null) {
-            for (String configuredAssetFolderPath : configuredAssetFolderPaths) {
-                if (StringUtils.isNotBlank(configuredAssetFolderPath)) {
-                    Resource configuredAssetFolder = resolver.getResource(configuredAssetFolderPath);
-                    if (configuredAssetFolder != null && configuredAssetFolder.isResourceType("sling:OrderedFolder")) {
-                        for (Resource assetFolder : getAssetFolders(configuredAssetFolder)) {
-                            if (!allAssetFolders.containsKey(assetFolder.getPath())) {
-                                allAssetFolders.put(assetFolder.getPath(), assetFolder);
-                            }
-                        }
-                    }
-                }
+        } catch (AssetResourceVisitorException e) {
+            if(e.getCause() instanceof  IOException) {
+                throw new IOException(e);
+            } else {
+                throw new ServletException(e);
             }
         }
-        return allAssetFolders.values();
     }
 
-    private List<Resource> getAssetFolders(Resource assetFolder) {
-        List<Resource> damFolders = new ArrayList<Resource>();
-        damFolders.add(assetFolder);
-        for (Iterator<Resource> children = assetFolder.listChildren(); children.hasNext();) {
-            Resource assetFolderChild = children.next();
-            if (assetFolderChild.isResourceType("sling:OrderedFolder")) {
-                damFolders.addAll(getAssetFolders(assetFolderChild));
+    private void writeAssets(final String[] damPaths, final XMLStreamWriter stream,
+                             final ResourceResolver resourceResolver) throws AssetResourceVisitorException {
+        for (final String damPath : damPaths) {
+            if (StringUtils.isNotBlank(damPath)) {
+                AssetResourceVisitor assetVisitor = new AssetResourceVisitor(stream);
+                assetVisitor.accept(resourceResolver.getResource(damPath));
             }
         }
-        return damFolders;
     }
-
-    private void write(Page page, XMLStreamWriter stream, ResourceResolver resolver) throws XMLStreamException {
+    private void writePage(Page page, XMLStreamWriter stream, ResourceResolver resolver) throws XMLStreamException {
         stream.writeStartElement(NS, "url");
 
 
@@ -239,20 +235,6 @@ public final class SiteMapServlet extends SlingSafeMethodsServlet {
         stream.writeEndElement();
     }
 
-    private void writeAssets(final XMLStreamWriter stream, final Resource assetFolder, final ResourceResolver resolver)
-            throws XMLStreamException {
-        for (Iterator<Resource> children = assetFolder.listChildren(); children.hasNext();) {
-            Resource assetFolderChild = children.next();
-            if (assetFolderChild.isResourceType("dam:Asset")) {
-                Asset asset = assetFolderChild.adaptTo(Asset.class);
-
-                if (damAssetTypes.contains(asset.getMimeType())) {
-                    writeAsset(asset, stream, resolver);
-                }
-            }
-        }
-    }
-
     private void writeFirstPropertyValue(final XMLStreamWriter stream, final String elementName, final String[] propertyNames,
             final ValueMap properties) throws XMLStreamException {
         for (String prop : propertyNames) {
@@ -270,4 +252,66 @@ public final class SiteMapServlet extends SlingSafeMethodsServlet {
         stream.writeEndElement();
     }
 
+
+    /**
+     * Resource tree visitor that looks for dam:Assets, visits them, but not their descendants.
+     */
+    private final class AssetResourceVisitor extends AbstractResourceVisitor {
+        private final XMLStreamWriter stream;
+
+        public AssetResourceVisitor(XMLStreamWriter stream) {
+            this.stream = stream;
+        }
+
+        private boolean isAsset(Resource resource) throws RepositoryException {
+            Node node = resource.adaptTo(Node.class);
+            return (node != null && node.isNodeType(DamConstants.NT_DAM_ASSET);
+        }
+
+        @Override
+        public void accept(final Resource resource) {
+            // Don't try to traverse null resources
+            if (resource == null) { return; }
+
+            try {
+                if (isAsset(resource)) {
+                    // perform work on the asset but DONT traverse its children
+                    this.visit(resource);
+                } else {
+                    // This is not an asset so inspect its descendants to see if they are Assets
+                    this.traverseChildren(resource.listChildren());
+                }
+            } catch (RepositoryException e) {
+                log.error("Could not check the node type of  [ {} ].", resource.getPath(), e);
+                throw new AssetResourceVisitorException(e);
+            }
+        }
+
+        @Override
+        protected void visit(final Resource resource) {
+            Asset asset = resource.adaptTo(Asset.class);
+
+            if(asset != null) {
+                if (damAssetTypes.contains(asset.getMimeType()))  {
+                    try {
+                        writeAsset(asset, this.stream, resource.getResourceResolver());
+                    } catch (XMLStreamException e) {
+                        log.error("Unable to write Asset [ {} ] to XML stream.", resource.getPath(), e);
+                        throw new AssetResourceVisitorException(e);
+                    }
+                }
+            } else {
+                log.warn("Resource [ {} ] could not be adapted to an Asset.", resource.getPath());
+            }
+        }
+    }
+
+    /**
+     * Unchecked Exception class as the AbstractResourceVisitor does not support throwing of checked exceptions.
+     */
+    private class AssetResourceVisitorException extends RuntimeException {
+        public AssetResourceVisitorException(Exception e) {
+            super(e);
+        }
+    }
 }
